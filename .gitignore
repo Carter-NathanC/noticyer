@@ -1,0 +1,15 @@
+#Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+#Caches
+pycache/
+*.pyc
+cache.json
+
+#IDEs
+.vscode/
+.idea/
