@@ -1,5 +1,0 @@
-requests2.31.0
-python-dotenv1.0.1
-icalendar5.0.11
-recurring-ical-events2.1.3
-pytz==2024.1

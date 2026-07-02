@@ -6,6 +6,7 @@ import smtplib
 import threading
 import http.server
 import socketserver
+import sys
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
@@ -30,10 +31,9 @@ WEB_PORT = int(os.getenv("WEB_PORT", 3000))
 CACHE_FILE = "cache.json"
 
 def format_time(time_str):
-    """Converts 24h '19:12' into 12h '7:12PM' format."""
+    """Converts 24h '19:12' into compact '7:12p' format for watches."""
     dt = datetime.strptime(time_str, "%H:%M")
-    # %I gives 07, lstrip('0') removes leading zero for a cleaner look
-    return dt.strftime("%I:%M%p").lstrip('0')
+    return dt.strftime("%I:%M%p").lstrip('0').replace('AM', 'a').replace('PM', 'p')
 
 def get_shift_id(shift):
     """Generates a unique string identifier for a shift to compare against cache."""
@@ -54,7 +54,6 @@ def merge_blocks(blocks):
     for current in blocks[1:]:
         prev = merged[-1]
         if current[0] <= prev[1]:
-            # Overlapping or touching, merge them
             merged[-1] = (prev[0], max(prev[1], current[1]))
         else:
             merged.append(current)
@@ -75,11 +74,9 @@ def fetch_ics_events(start_dt, end_dt, tz_name="America/Chicago"):
         tz = pytz.timezone(tz_name)
         
         for event in events:
-            # Ignore all-day events (type is date, not datetime)
             if type(event["DTSTART"].dt) is date:
                 continue
                 
-            # Ignore if *Ignore* in description
             desc = event.get('DESCRIPTION', '')
             if desc and "*Ignore*" in desc.to_ical().decode('utf-8'):
                 continue
@@ -87,7 +84,6 @@ def fetch_ics_events(start_dt, end_dt, tz_name="America/Chicago"):
             ev_start = event["DTSTART"].dt
             ev_end = event["DTEND"].dt
             
-            # Convert to local timezone
             if ev_start.tzinfo is None:
                 ev_start = tz.localize(ev_start)
             else:
@@ -106,15 +102,12 @@ def fetch_ics_events(start_dt, end_dt, tz_name="America/Chicago"):
 
 def evaluate_shift_rules(shift_date, shift_start_dt, shift_end_dt, week_blocks):
     """Evaluates the 5 transit scheduling rules against the proposed shift."""
-    # 1. Overlap Check (Cannot work if you already have an event at this time)
     for block in week_blocks:
         if max(shift_start_dt, block[0]) < min(shift_end_dt, block[1]):
             return False, "Overlaps with existing schedule"
     
-    # Add proposed shift to blocks and sort them by day
     test_blocks = week_blocks + [(shift_start_dt, shift_end_dt)]
     
-    # Group by date
     daily_blocks = {}
     for b_start, b_end in test_blocks:
         b_date = b_start.date()
@@ -122,7 +115,6 @@ def evaluate_shift_rules(shift_date, shift_start_dt, shift_end_dt, week_blocks):
             daily_blocks[b_date] = []
         daily_blocks[b_date].append((b_start, b_end))
         
-    # Rule 1: Max 6 days per week (Mon-Sun)
     if len(daily_blocks) > 6:
         return False, "Cannot work more than 6 days a week"
         
@@ -130,17 +122,14 @@ def evaluate_shift_rules(shift_date, shift_start_dt, shift_end_dt, week_blocks):
     if shift_d in daily_blocks:
         merged_day = merge_blocks(daily_blocks[shift_d])
         
-        # Rule 3: Max 10 hours a day
         total_hours = sum((b[1] - b[0]).total_seconds() / 3600 for b in merged_day)
         if total_hours > 10.0:
             return False, f"Exceeds 10 hours a day (Total: {total_hours:.1f}h)"
             
-        # Rule 4: Max 16 hours spread
         spread = (merged_day[-1][1] - merged_day[0][0]).total_seconds() / 3600
         if spread > 16.0:
             return False, f"Exceeds 16 hours spread (Spread: {spread:.1f}h)"
             
-        # Rule 2: Max 6 hours straight without 30m break
         seq_start = merged_day[0][0]
         seq_end = merged_day[0][1]
         
@@ -150,17 +139,14 @@ def evaluate_shift_rules(shift_date, shift_start_dt, shift_end_dt, week_blocks):
         for b_start, b_end in merged_day[1:]:
             gap = (b_start - seq_end).total_seconds() / 3600
             if gap < 0.5:
-                # Merge into consecutive block if break is less than 30 mins
                 seq_end = max(seq_end, b_end)
             else:
-                # Break resets the straight time
                 seq_start = b_start
                 seq_end = b_end
                 
             if (seq_end - seq_start).total_seconds() / 3600 > 6.0:
                 return False, "More than 6 hours straight without a half-hour break"
                 
-    # Rule 5: 9 hour break overnight
     prev_d = shift_d - timedelta(days=1)
     next_d = shift_d + timedelta(days=1)
     
@@ -179,7 +165,7 @@ def evaluate_shift_rules(shift_date, shift_start_dt, shift_end_dt, week_blocks):
             
     return True, "Valid"
 
-def send_notification(new_shifts):
+def send_notification(new_shifts, is_test=False):
     """Formats and sends the email containing new shifts."""
     if not new_shifts:
         return
@@ -188,33 +174,27 @@ def send_notification(new_shifts):
     
     shift_blocks = []
     for shift in new_shifts:
-        # Date parsing
         date_obj = datetime.strptime(shift['date'], "%Y-%m-%d")
-        day_name = date_obj.strftime("%A")
-        date_str = date_obj.strftime("%m/%d/%Y")
+        day_name = date_obj.strftime("%a")
+        date_str = f"{date_obj.month}/{date_obj.day}"
         
-        # Time parsing
         start_time = format_time(shift['start'])
         end_time = format_time(shift['end'])
         
-        # Format overtime output
-        ot_str = "Yes" if shift.get('OT') else "No"
+        ot_str = "Y" if shift.get('OT') else "N"
         
-        # Block assembly based on requested format
-        block = f"{day_name} - {date_str}:\n"
-        block += f"{shift['run']} ({shift['route']}) | {start_time} - {end_time} ({shift['hours']}h) [OT: {ot_str}]\n"
-        block += "https://cyride.net/sync/open.html"
+        block = f"{day_name} {date_str} | {shift['run']}({shift['route']})\n"
+        block += f"{start_time}-{end_time} ({shift['hours']}h) OT:{ot_str}"
         shift_blocks.append(block)
 
     body = "\n\n".join(shift_blocks)
+    body += "\n\ncyride.net/sync/open.html"
     
-    # Setup the email
     msg = MIMEText(body)
-    msg['Subject'] = "New CyRide Open Shift(s) Available!"
+    msg['Subject'] = "[TEST] CyRide Ping" if is_test else "New CyRide Shift(s)!"
     msg['From'] = ZOHO_USER
     msg['To'] = RECIPIENT
 
-    # Connect to Zoho SMTP and send
     try:
         server = smtplib.SMTP(ZOHO_HOST, ZOHO_PORT)
         server.starttls()
@@ -225,4 +205,174 @@ def send_notification(new_shifts):
     except Exception as e:
         print(f"[{datetime.now()}] Error sending email: {e}")
 
-def
+def check_for_shifts():
+    """Fetches data, compares with cache, evaluates scheduling rules, and triggers emails."""
+    try:
+        response = requests.get(URL, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"[{datetime.now()}] Failed to fetch or parse JSON: {e}")
+        return
+
+    cached_data = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                cached_data = json.load(f)
+        except Exception:
+            cached_data = {}
+
+    cached_shift_ids = set()
+    if 'days' in cached_data:
+        for day_data in cached_data['days'].values():
+            for shift in day_data.get('signups', []):
+                cached_shift_ids.add(get_shift_id(shift))
+
+    min_date = None
+    max_date = None
+    if 'days' in data:
+        for day_data in data['days'].values():
+            day_date = datetime.strptime(day_data['date'], "%Y-%m-%d").date()
+            if not min_date or day_date < min_date:
+                min_date = day_date
+            if not max_date or day_date > max_date:
+                max_date = day_date
+    
+    ics_week_blocks = []
+    tz = pytz.timezone("America/Chicago")
+    if min_date and max_date:
+        fetch_start = tz.localize(datetime.combine(min_date - timedelta(days=7), datetime.min.time()))
+        fetch_end = tz.localize(datetime.combine(max_date + timedelta(days=7), datetime.max.time()))
+        ics_week_blocks = fetch_ics_events(fetch_start, fetch_end)
+
+    processed_diffs = []
+    valid_shifts_to_notify = []
+
+    if 'days' in data:
+        for day_data in data['days'].values():
+            for shift in day_data.get('signups', []):
+                shift_id = get_shift_id(shift)
+                
+                if shift_id not in cached_shift_ids:
+                    s_dt = parse_datetime(shift['date'], shift['start'])
+                    e_dt = parse_datetime(shift['date'], shift['end'])
+                    if e_dt <= s_dt:
+                        e_dt += timedelta(days=1)
+                        
+                    calc_hours = round((e_dt - s_dt).total_seconds() / 3600, 2)
+                    
+                    shift_date_obj = s_dt.date()
+                    monday = shift_date_obj - timedelta(days=shift_date_obj.weekday())
+                    sunday = monday + timedelta(days=6)
+                    
+                    week_start = tz.localize(datetime.combine(monday - timedelta(days=1), datetime.min.time()))
+                    week_end = tz.localize(datetime.combine(sunday + timedelta(days=1), datetime.max.time()))
+                    
+                    relevant_blocks = [b for b in ics_week_blocks if b[0] >= week_start and b[1] <= week_end]
+                    
+                    works, reason = evaluate_shift_rules(shift_date_obj, s_dt, e_dt, relevant_blocks)
+                    
+                    is_ot = shift.get('overtime', False)
+                    
+                    diff_record = {
+                        "run": shift.get('run', ''),
+                        "route": shift.get('route', ''),
+                        "start": shift.get('start', ''),
+                        "end": shift.get('end', ''),
+                        "hours": calc_hours,
+                        "OT": is_ot,
+                        "worksWithSchedule": works,
+                        "failReason": reason
+                    }
+                    processed_diffs.append(diff_record)
+                    
+                    if works:
+                        shift['hours'] = calc_hours
+                        shift['OT'] = is_ot
+                        valid_shifts_to_notify.append(shift)
+
+    if processed_diffs:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        diff_filename = f"diff_{timestamp}.json"
+        try:
+            with open(diff_filename, 'w') as f:
+                json.dump(processed_diffs, f, indent=4)
+            print(f"[{datetime.now()}] Saved {len(processed_diffs)} new evaluated shifts to {diff_filename}")
+        except Exception as e:
+            print(f"[{datetime.now()}] Failed to save diff json: {e}")
+
+    if valid_shifts_to_notify and cached_data:
+        send_notification(valid_shifts_to_notify)
+
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(data, f)
+
+def run_test_ping():
+    """Fetches the latest JSON, picks a shift (or creates a mock one), and sends a test email."""
+    print(f"[{datetime.now()}] Running test ping...")
+    try:
+        response = requests.get(URL, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"[{datetime.now()}] Failed to fetch JSON for test: {e}")
+        return
+        
+    test_shift = None
+    if 'days' in data:
+        for day_data in data['days'].values():
+            if day_data.get('signups'):
+                test_shift = day_data['signups'][0].copy()
+                test_shift['hours'] = 4.0
+                test_shift['OT'] = False
+                test_shift['route'] = f"TEST - {test_shift.get('route', 'Unknown')}"
+                break
+                
+    if not test_shift:
+        print("No shifts found in JSON. Using mock shift for test...")
+        test_shift = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "run": "99",
+            "start": "12:00",
+            "end": "16:00",
+            "hours": 4.0,
+            "route": "TEST Route",
+            "OT": False
+        }
+        
+    send_notification([test_shift], is_test=True)
+    print("Test ping complete. Exiting.")
+
+def start_health_server(port):
+    """Starts a dummy web server to keep PaaS providers happy."""
+    class HealthHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'CyRide Notifier is actively running.')
+            
+    class QuietServer(socketserver.TCPServer):
+        def log_message(self, format, *args):
+            pass
+
+    try:
+        with QuietServer(("", port), HealthHandler) as httpd:
+            print(f"Health server listening on port {port}")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"Failed to bind web server to port {port}: {e}")
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        run_test_ping()
+        sys.exit(0)
+
+    print(f"Starting CyRide Notifier... checking every {CHECK_INTERVAL} seconds.")
+    
+    threading.Thread(target=start_health_server, args=(WEB_PORT,), daemon=True).start()
+
+    while True:
+        check_for_shifts()
+        time.sleep(CHECK_INTERVAL)
