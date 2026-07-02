@@ -9,6 +9,7 @@ ENV/
 pycache/
 *.pyc
 cache.json
+diff*
 
 #IDEs
 .vscode/
